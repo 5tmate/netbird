@@ -1,0 +1,33 @@
+name: prune image versions
+
+# Deletes ghcr.io/5tmate/netbird-server versions whose tags match a pattern.
+# Run by hand; the pattern is anchored, so "^0\.79\." removes only 0.79 builds.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pattern:
+        description: regular expression matched against each version's tags
+        required: true
+
+permissions:
+  packages: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete matching versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PATTERN: ${{ inputs.pattern }}
+        run: |
+          set -euo pipefail
+          api=orgs/5tmate/packages/container/netbird-server/versions
+          gh api "$api" --paginate --jq '.[] | "\(.id) \(.metadata.container.tags | join(","))"' > versions.txt
+          echo "versions:"; cat versions.txt
+          while read -r id tags; do
+            if echo "$tags" | tr ',' '\n' | grep -Eq "$PATTERN"; then
+              gh api -X DELETE "$api/$id" && echo "deleted $id ($tags)"
+            fi
+          done < versions.txt
