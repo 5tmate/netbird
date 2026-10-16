@@ -40,6 +40,14 @@ const (
 	receiveWatchdogInterval = 10 * time.Second
 	// defaultRegistrationTimeout bounds the wait for a new stream's registration header.
 	defaultRegistrationTimeout = 10 * time.Second
+	// defaultRegistrationProbeInterval is how often connect sends a self-addressed
+	// heartbeat while the registration header is outstanding. The server writes
+	// it back onto this peer's own stream, and that body frame makes
+	// intermediaries that release a gRPC response only once body bytes exist
+	// (AWS CloudFront and ALB do this) release the header with it. Without it
+	// the header sits at such a proxy until its read timeout, which is longer
+	// than the registration bound, and the client never registers.
+	defaultRegistrationProbeInterval = time.Second
 )
 
 // errReceiveStreamStalled is reported when the receive stream is transport-alive
@@ -95,7 +103,8 @@ type GrpcClient struct {
 	receiveHandoffBlocked atomic.Bool
 	watchdogWg            sync.WaitGroup
 
-	registrationTimeout time.Duration
+	registrationTimeout       time.Duration
+	registrationProbeInterval time.Duration
 }
 
 // Option configures optional GrpcClient behavior.
@@ -117,6 +126,8 @@ func NewClient(ctx context.Context, addr string, key wgtypes.Key, tlsEnabled boo
 		status:                StreamDisconnected,
 		connStateCallbackLock: sync.RWMutex{},
 		registrationTimeout:   defaultRegistrationTimeout,
+
+		registrationProbeInterval: defaultRegistrationProbeInterval,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -324,11 +335,47 @@ func (c *GrpcClient) connect(ctx context.Context, cancel context.CancelFunc, key
 	if err != nil {
 		return nil, err
 	}
-	if err := awaitRegistration(stream, c.registrationTimeout, cancel); err != nil {
+	stopProbes := c.probeUntilRegistered(ctx)
+	err = awaitRegistration(stream, c.registrationTimeout, cancel)
+	stopProbes()
+	if err != nil {
 		return nil, err
 	}
 
 	return stream, nil
+}
+
+// probeUntilRegistered sends the self-addressed heartbeat every
+// registrationProbeInterval until the returned stop function is called. The
+// probe goes over the unary Send RPC, which proxies complete normally, and the
+// server forwards it onto this peer's stream as its first body frame. A probe
+// that reaches the server before RegisterPeer has run is dropped there; the
+// next one lands. A zero interval disables probing.
+func (c *GrpcClient) probeUntilRegistered(ctx context.Context) func() {
+	if c.registrationProbeInterval <= 0 {
+		return func() {}
+	}
+	probeCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(c.registrationProbeInterval)
+		defer ticker.Stop()
+		for {
+			if err := c.sendReceiveProbe(probeCtx); err != nil && probeCtx.Err() == nil {
+				log.Tracef("registration probe not delivered yet: %v", err)
+			}
+			select {
+			case <-ticker.C:
+			case <-probeCtx.Done():
+				return
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 func awaitRegistration(stream proto.SignalExchange_ConnectStreamClient, timeout time.Duration, cancel context.CancelFunc) error {
