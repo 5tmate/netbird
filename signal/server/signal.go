@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -39,6 +40,7 @@ const (
 	labelErrorMissingMeta        = "missing_meta"
 	labelErrorFailedHeader       = "failed_header"
 	labelErrorFailedRegistration = "failed_registration"
+	labelErrorFailedFrame        = "failed_registration_frame"
 
 	labelRegistrationStatus   = "status"
 	labelRegistrationFound    = "found"
@@ -64,6 +66,13 @@ type Server struct {
 	successHeader metadata.MD
 
 	sendTimeout time.Duration
+
+	// registrationFrame makes ConnectStream write one empty self-addressed message right after
+	// the registration header. Proxies that release a gRPC response only once body bytes exist,
+	// CloudFront and ALB among them, otherwise hold the header until their read timeout, and
+	// clients from 0.81.1 give up after 10 s. The client cannot decrypt the frame and drops it
+	// after one log line. Off unless NB_SIGNAL_REGISTRATION_FRAME is set.
+	registrationFrame bool
 }
 
 // NewServer creates a new Signal server
@@ -91,6 +100,8 @@ func NewServer(ctx context.Context, meter metric.Meter, metricsPrefix ...string)
 		metrics:       appMetrics,
 		successHeader: metadata.Pairs(proto.HeaderRegistered, "1"),
 		sendTimeout:   sTimeout,
+
+		registrationFrame: registrationFrameEnabled(),
 	}
 
 	stopProfiling := profiling.Start(applicationName)
@@ -105,6 +116,11 @@ func (s *Server) Stop() {
 }
 
 // Send forwards a message to the signal peer
+func registrationFrameEnabled() bool {
+	enabled, err := strconv.ParseBool(os.Getenv("NB_SIGNAL_REGISTRATION_FRAME"))
+	return err == nil && enabled
+}
+
 func (s *Server) Send(ctx context.Context, msg *proto.EncryptedMessage) (*proto.EncryptedMessage, error) {
 	log.Tracef("received a new message to send from peer [%s] to peer [%s]", msg.Key, msg.RemoteKey)
 
@@ -131,6 +147,13 @@ func (s *Server) ConnectStream(stream proto.SignalExchange_ConnectStreamServer) 
 	if err != nil {
 		s.metrics.RegistrationFailures.Add(stream.Context(), 1, metric.WithAttributes(attribute.String(labelError, labelErrorFailedHeader)))
 		return err
+	}
+
+	if s.registrationFrame {
+		if err := p.Send(&proto.EncryptedMessage{Key: p.Id, RemoteKey: p.Id}); err != nil {
+			s.metrics.RegistrationFailures.Add(stream.Context(), 1, metric.WithAttributes(attribute.String(labelError, labelErrorFailedFrame)))
+			return err
+		}
 	}
 
 	log.Debugf("peer connected [%s] [streamID %d] ", p.Id, p.StreamID)
